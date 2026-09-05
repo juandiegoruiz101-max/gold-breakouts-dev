@@ -4,3 +4,8 @@ __pycache__/
 
 # regenerable ForexFactory HTML caches -- can be multiple GB over time
 01 Data/raw/
+
+# local launchd wrapper scripts -- hardcode this machine's paths and the
+# private ntfy.sh topic, so they stay local instead of going to GitHub
+scripts/
+logs/

@@ -23,6 +23,8 @@ a bit longer than the cron interval so nothing falls in the gap between runs.
 from __future__ import annotations
 
 import argparse
+import os
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -88,6 +90,25 @@ def compound_pairs(evs: list[CanonicalEvent]) -> list[tuple[CanonicalEvent, Cano
     return out
 
 
+def notify(message: str, *, title: str = "Forex") -> None:
+    """Push straight to ntfy.sh -- no cloud round-trip, no Claude session needed.
+    No-op unless NTFY_TOPIC is set (kept out of the repo; passed by the local
+    launchd wrapper)."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    req = urllib.request.Request(
+        f"https://ntfy.sh/{topic}",
+        data=message.encode("utf-8"),
+        headers={"Title": title},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as exc:
+        print(f"ntfy send failed: {exc}")
+
+
 def describe_pair(ei: CanonicalEvent, ej: CanonicalEvent, diff: float) -> str:
     strong, weak = (ei, ej) if diff > 0 else (ej, ei)
     pair = f"{strong.currency}/{weak.currency}"
@@ -100,12 +121,19 @@ def cmd_brief() -> None:
     events = fetch_today()
     groups = clusters(events)
     print(f"Calendario de hoy ({datetime.now(MTY):%Y-%m-%d}) -- impacto alto/medio, hora Monterrey\n")
+    flagged = []
     for ts, evs in sorted(groups.items()):
         t_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         t_mty = t_utc.astimezone(MTY)
         cur = sorted({e.currency for e in evs})
-        flag = "  <-- varias monedas, vigilar este horario" if len(cur) > 1 else ""
+        multi = len(cur) > 1
+        flag = "  <-- varias monedas, vigilar este horario" if multi else ""
         print(f"{t_mty:%H:%M} MTY  {'/'.join(cur):<12} " + ", ".join(e.title for e in evs) + flag)
+        if multi:
+            flagged.append(f"{t_mty:%H:%M} {'/'.join(cur)}")
+
+    summary = ("Hoy vigilar: " + "; ".join(flagged)) if flagged else "Hoy sin cruces de monedas -- dia tranquilo."
+    notify(summary[:200], title="Forex - brief del dia")
 
 
 def cmd_check() -> None:
@@ -132,8 +160,12 @@ def cmd_check() -> None:
     if not found:
         print("NOTHING NEW")
         return
+    descriptions = []
     for ei, ej, diff in found:
-        print("MOVER:", describe_pair(ei, ej, diff))
+        desc = describe_pair(ei, ej, diff)
+        print("MOVER:", desc)
+        descriptions.append(desc)
+    notify(" | ".join(descriptions)[:200], title="Forex - movimiento grande")
 
 
 def main(argv=None) -> None:
