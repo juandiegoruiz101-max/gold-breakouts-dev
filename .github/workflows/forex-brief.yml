@@ -1,8 +1,11 @@
-name: network-test
+name: forex-brief
 on:
+  schedule:
+    # 06:15 UTC = 00:15 America/Monterrey (fixed UTC-6), weekdays
+    - cron: "15 6 * * 1-5"
   workflow_dispatch: {}
 jobs:
-  test:
+  brief:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -10,4 +13,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q -r requirements.txt
-      - run: python3 -m movers.scan check
+      - run: python3 -m movers.scan brief
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}

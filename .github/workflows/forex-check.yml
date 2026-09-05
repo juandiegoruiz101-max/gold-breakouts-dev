@@ -1,0 +1,19 @@
+name: forex-check
+on:
+  schedule:
+    # every 30 min, 07:00-17:30 UTC (covers 01:30-11:00 America/Monterrey,
+    # the London+NY window), weekdays
+    - cron: "0,30 7-17 * * 1-5"
+  workflow_dispatch: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q -r requirements.txt
+      - run: python3 -m movers.scan check
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
