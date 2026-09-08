@@ -1,10 +1,10 @@
 """ForexFactory calendar watcher.
 
+Covers every high AND medium impact event (anything that can nudge price).
 Two things, per run:
-  1. a heads-up BEFORE a high-impact release ("UPCOMING") so there is time to
-     get ready, and
-  2. a direction call the moment a high-impact number lands off forecast
-     ("MOVER"): which way the currency leans, up or down.
+  1. a heads-up BEFORE a release ("UPCOMING") so there is time to get ready, and
+  2. a direction call the moment a number lands off forecast ("MOVER"): which
+     way the currency leans, up or down. Lines are tagged [alto] / [medio].
 
 Modes:
     python3 -m movers.scan brief   -- once a day: the full schedule for today
@@ -39,8 +39,8 @@ RAW_DIR = REPO / "01 Data" / "raw" / "forexfactory"
 
 MTY = ZoneInfo("America/Monterrey")  # fixed UTC-6, no DST since Mexico's 2022 reform
 
-BRIEF_IMPACT = ("high", "medium")   # what the daily brief lists
-LEAD_MIN = 12       # "UPCOMING" fires for high-impact events releasing within this window
+WATCH_IMPACT = ("high", "medium")   # brief + watch both cover high AND medium
+LEAD_MIN = 12       # "UPCOMING" fires for events releasing within this window
 LOOKBACK_MIN = 8    # "MOVER" fires for releases at most this old (keep >= cron interval)
 
 # stronger double-surprise cluster (bonus, higher-conviction tag)
@@ -93,7 +93,7 @@ def fetch_today() -> list[CanonicalEvent]:
     return [src.to_canonical(e) for e in raw if e.get("currency")]
 
 
-def clusters(events: list[CanonicalEvent], impacts=BRIEF_IMPACT) -> dict[str, list[CanonicalEvent]]:
+def clusters(events: list[CanonicalEvent], impacts=WATCH_IMPACT) -> dict[str, list[CanonicalEvent]]:
     groups: dict[str, list[CanonicalEvent]] = {}
     for e in events:
         if e.impact in impacts:
@@ -161,26 +161,26 @@ def cmd_watch() -> None:
     now = datetime.now(timezone.utc)
     recent = now - timedelta(minutes=LOOKBACK_MIN)
     events = fetch_today()
-    high = [e for e in events if e.impact == "high"]
+    watched = [e for e in events if e.impact in WATCH_IMPACT]  # high AND medium
 
     lines: list[str] = []
 
-    # 1) heads-up: high-impact events about to release
-    for e in sorted(high, key=lambda e: e.datetime_utc):
+    # 1) heads-up: events about to release
+    for e in sorted(watched, key=lambda e: e.datetime_utc):
         if e.actual_raw:
             continue
         mins = (_ts(e.datetime_utc) - now).total_seconds() / 60
         if 0 < mins <= LEAD_MIN:
-            others = sorted({x.currency for x in high
+            others = sorted({x.currency for x in watched
                              if x.datetime_utc == e.datetime_utc and x.currency != e.currency})
             extra = f" (+ {', '.join(others)} al mismo tiempo)" if others else ""
             lines.append(f"UPCOMING: en ~{round(mins)} min "
                          f"({_ts(e.datetime_utc).astimezone(MTY):%H:%M} MTY) "
-                         f"{e.currency} {e.title}{extra} -- preparate")
+                         f"[{e.impact}] {e.currency} {e.title}{extra} -- preparate")
 
     # 2) direction: high-conviction double-surprise clusters first
     clustered_ids: set[str] = set()
-    for ts, evs in clusters(events, impacts=("high",)).items():
+    for ts, evs in clusters(events, impacts=WATCH_IMPACT).items():
         if not (recent <= _ts(ts) <= now):
             continue
         for ei, ej, diff in compound_pairs(evs):
@@ -192,10 +192,10 @@ def cmd_watch() -> None:
                 f"{weak.forecast_raw} -> {strong.currency}/{weak.currency} se inclina ARRIBA"
             )
 
-    # 3) direction: single high-impact releases off forecast, grouped so the
-    #    four CPI sub-series (m/m, y/y, core...) become one line, not four
+    # 3) direction: single releases off forecast, grouped so the four CPI
+    #    sub-series (m/m, y/y, core...) become one line, not four
     buckets: dict[tuple, list[CanonicalEvent]] = defaultdict(list)
-    for e in high:
+    for e in watched:
         if not e.actual_raw or e.source_better_worse == 0 or e.source_event_id in clustered_ids:
             continue
         if recent <= _ts(e.datetime_utc) <= now:
@@ -203,18 +203,19 @@ def cmd_watch() -> None:
 
     for (cur, _dt, bw), evs in buckets.items():
         stronger = bw == 1
+        imp = "alto" if any(e.impact == "high" for e in evs) else "medio"
         detail = "; ".join(f"{e.title} {e.actual_raw} vs {e.forecast_raw}" for e in evs[:3])
-        lines.append(f"MOVER: {cur} ({detail}) {'mas fuerte' if stronger else 'mas debil'} "
+        lines.append(f"MOVER [{imp}]: {cur} ({detail}) {'mas fuerte' if stronger else 'mas debil'} "
                      f"de lo esperado -> {lean(cur, stronger)}")
 
     if not lines:
         print("NOTHING NEW")
         return
-    for ln in lines[:6]:
+    for ln in lines[:8]:
         print(ln)
         title = "Forex - por salir" if ln.startswith("UPCOMING") else "Forex - direccion"
         notify(ln[:200], title=title)
-    for ln in lines[6:]:
+    for ln in lines[8:]:
         print(ln)
 
 
