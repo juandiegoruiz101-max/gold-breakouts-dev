@@ -24,6 +24,7 @@ cron interval so nothing slips through the gap between runs.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import urllib.request
@@ -214,7 +215,9 @@ def classify_headline(title: str) -> dict | None:
         )
         raw = urllib.request.urlopen(req, timeout=20).read()
         text = json.loads(raw)["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
+        # Gemini sometimes HTML-entity-encodes accented characters (e.g. "d&#243;lar")
+        return {k: (html.unescape(v) if isinstance(v, str) else v)
+                for k, v in json.loads(text).items()}
     except Exception as exc:
         print(f"gemini classify failed: {exc}")
         return None
