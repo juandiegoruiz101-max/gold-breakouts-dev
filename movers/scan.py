@@ -62,29 +62,23 @@ NEWS_FEEDS = (
 )
 NEWS_LOOKBACK_MIN = 15
 
-# Claude reads each headline that passes the keyword filter and calls the
-# direction -- this is what a keyword match alone can't do (see below).
-_CLASSIFY_MODEL = "claude-haiku-4-5"
-_CLASSIFY_TOOL = {
-    "name": "classify_headline",
-    "description": "Classify whether a financial news headline is relevant to "
-                    "major FX pairs and which way it leans.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "relevant": {"type": "boolean",
-                         "description": "true if this could move a major FX pair today"},
-            "currency": {"type": "string",
-                         "description": "the single currency most affected: USD, EUR, GBP, "
-                                        "JPY, AUD, CAD, CHF or NZD; empty string if none fits"},
-            "direction": {"type": "string", "enum": ["up", "down", "neutral"],
-                          "description": "does that currency strengthen, weaken, or neither"},
-            "reason": {"type": "string", "description": "why, in Spanish, under 12 words"},
-        },
-        "required": ["relevant", "currency", "direction", "reason"],
-        "additionalProperties": False,
+# Gemini (free tier) reads each headline that passes the keyword filter and
+# calls the direction -- this is what a keyword match alone can't do.
+_CLASSIFY_MODEL = "gemini-flash-lite-latest"
+_CLASSIFY_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_CLASSIFY_MODEL}:generateContent"
+_CLASSIFY_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "relevant": {"type": "BOOLEAN",
+                     "description": "true if this could move a major FX pair today"},
+        "currency": {"type": "STRING",
+                     "description": "the single currency most affected: USD, EUR, GBP, "
+                                    "JPY, AUD, CAD, CHF or NZD; empty string if none fits"},
+        "direction": {"type": "STRING", "enum": ["up", "down", "neutral"],
+                      "description": "does that currency strengthen, weaken, or neither"},
+        "reason": {"type": "STRING", "description": "why, in Spanish, under 12 words"},
     },
-    "strict": True,
+    "required": ["relevant", "currency", "direction", "reason"],
 }
 NEWS_KEYWORDS = (
     "fed", "fomc", "powell", "boj", "bank of japan", "ueda", "ecb", "lagarde",
@@ -193,38 +187,37 @@ def _recent_ntfy_bodies(hours: int = 12) -> set[str]:
 
 
 def classify_headline(title: str) -> dict | None:
-    """Ask Claude whether this headline matters for FX and which way it leans.
-    Returns None if ANTHROPIC_API_KEY is unset or the call fails -- callers
-    fall back to forwarding the raw headline (no direction) in that case."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    """Ask Gemini whether this headline matters for FX and which way it leans.
+    Returns None if GEMINI_API_KEY is unset or the call fails -- callers fall
+    back to forwarding the raw headline (no direction) in that case."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
         return None
+    body = {
+        "contents": [{"parts": [{"text": (
+            f"Financial news-wire headline: {title!r}\n\n"
+            "Is this likely to move a major FX pair today? If so, which "
+            "single currency is most affected, and does it strengthen or "
+            "weaken? Answer the 'reason' field in Spanish, under 12 words."
+        )}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": _CLASSIFY_SCHEMA,
+        },
+    }
     try:
-        import anthropic
-    except ImportError:
-        return None
-    try:
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model=_CLASSIFY_MODEL,
-            max_tokens=256,
-            tools=[_CLASSIFY_TOOL],
-            tool_choice={"type": "tool", "name": "classify_headline"},
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Financial news-wire headline: {title!r}\n\n"
-                    "Is this likely to move a major FX pair today? If so, which "
-                    "single currency is most affected, and does it strengthen "
-                    "or weaken?"
-                ),
-            }],
+        req = urllib.request.Request(
+            f"{_CLASSIFY_URL}?key={key}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        for block in resp.content:
-            if block.type == "tool_use" and block.name == "classify_headline":
-                return block.input
+        raw = urllib.request.urlopen(req, timeout=20).read()
+        text = json.loads(raw)["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
     except Exception as exc:
-        print(f"claude classify failed: {exc}")
-    return None
+        print(f"gemini classify failed: {exc}")
+        return None
 
 
 def news_lines() -> list[str]:
