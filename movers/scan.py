@@ -61,6 +61,31 @@ NEWS_FEEDS = (
     "https://www.financialjuice.com/feed.ashx?xy=rss",
 )
 NEWS_LOOKBACK_MIN = 15
+
+# Claude reads each headline that passes the keyword filter and calls the
+# direction -- this is what a keyword match alone can't do (see below).
+_CLASSIFY_MODEL = "claude-haiku-4-5"
+_CLASSIFY_TOOL = {
+    "name": "classify_headline",
+    "description": "Classify whether a financial news headline is relevant to "
+                    "major FX pairs and which way it leans.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "relevant": {"type": "boolean",
+                         "description": "true if this could move a major FX pair today"},
+            "currency": {"type": "string",
+                         "description": "the single currency most affected: USD, EUR, GBP, "
+                                        "JPY, AUD, CAD, CHF or NZD; empty string if none fits"},
+            "direction": {"type": "string", "enum": ["up", "down", "neutral"],
+                          "description": "does that currency strengthen, weaken, or neither"},
+            "reason": {"type": "string", "description": "why, in Spanish, under 12 words"},
+        },
+        "required": ["relevant", "currency", "direction", "reason"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
 NEWS_KEYWORDS = (
     "fed", "fomc", "powell", "boj", "bank of japan", "ueda", "ecb", "lagarde",
     "boe", "bank of england", "bailey", "rba", "bank of canada", "boc", "snb",
@@ -167,9 +192,46 @@ def _recent_ntfy_bodies(hours: int = 12) -> set[str]:
     return bodies
 
 
+def classify_headline(title: str) -> dict | None:
+    """Ask Claude whether this headline matters for FX and which way it leans.
+    Returns None if ANTHROPIC_API_KEY is unset or the call fails -- callers
+    fall back to forwarding the raw headline (no direction) in that case."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=_CLASSIFY_MODEL,
+            max_tokens=256,
+            tools=[_CLASSIFY_TOOL],
+            tool_choice={"type": "tool", "name": "classify_headline"},
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Financial news-wire headline: {title!r}\n\n"
+                    "Is this likely to move a major FX pair today? If so, which "
+                    "single currency is most affected, and does it strengthen "
+                    "or weaken?"
+                ),
+            }],
+        )
+        for block in resp.content:
+            if block.type == "tool_use" and block.name == "classify_headline":
+                return block.input
+    except Exception as exc:
+        print(f"claude classify failed: {exc}")
+    return None
+
+
 def news_lines() -> list[str]:
-    """Fresh market-moving headlines from the news feeds (no direction call --
-    a keyword match can't judge sentiment)."""
+    """Fresh market-moving headlines from the news feeds. Each one that passes
+    the keyword pre-filter gets read by Claude, which drops it if it isn't
+    really FX-relevant and adds a direction call when it is. Without
+    ANTHROPIC_API_KEY, falls back to forwarding the plain headline."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=NEWS_LOOKBACK_MIN)
     already = _recent_ntfy_bodies()
@@ -204,7 +266,17 @@ def news_lines() -> list[str]:
         if title in seen:
             continue
         seen.add(title)
-        out.append(f"NOTICIA ({t.astimezone(MTY):%H:%M} MTY): {title}")
+        stamp = f"({t.astimezone(MTY):%H:%M} MTY)"
+
+        verdict = classify_headline(title)
+        if verdict is None:
+            out.append(f"NOTICIA {stamp}: {title}")
+            continue
+        if not verdict.get("relevant"):
+            continue  # Claude read it and it doesn't actually matter for FX
+        cur, direction, reason = verdict.get("currency", ""), verdict.get("direction", "neutral"), verdict.get("reason", "")
+        call = f" -> {lean(cur, direction == 'up')}" if cur and direction in ("up", "down") else ""
+        out.append(f"NOTICIA {stamp}: {title} [{reason}]{call}")
     return out
 
 

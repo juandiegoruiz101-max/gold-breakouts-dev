@@ -1,1 +1,2 @@
 cloudscraper>=1.2.71
+anthropic>=0.40
