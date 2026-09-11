@@ -24,10 +24,13 @@ cron interval so nothing slips through the gap between runs.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -50,6 +53,29 @@ CLUSTER_MIN = 0.35
 # how the pair is quoted, to turn "currency strengthens" into an up/down lean
 _INVERSE = {"EUR", "GBP", "AUD", "NZD"}   # quoted X/USD  -> X strong = pair up
 _DIRECT = {"JPY", "CAD", "CHF"}           # quoted USD/X  -> X strong = pair down
+
+# --- unscheduled news headlines (central-bank talk, geopolitics, ...) --------
+# Financial Juice = a real breaking-headline wire (squawk style). FXStreet's
+# feed is analyst opinion pieces published non-stop -> too noisy for alerts.
+NEWS_FEEDS = (
+    "https://www.financialjuice.com/feed.ashx?xy=rss",
+)
+NEWS_LOOKBACK_MIN = 15
+NEWS_KEYWORDS = (
+    "fed", "fomc", "powell", "boj", "bank of japan", "ueda", "ecb", "lagarde",
+    "boe", "bank of england", "bailey", "rba", "bank of canada", "boc", "snb",
+    "pboc", "rbnz", "central bank", "rate decision", "rate hike", "rate cut",
+    "rate-cut", "hike rates", "cut rates", "basis point", "hawkish", "dovish",
+    "tightening", "easing", "intervention", "yield", "quantitative",
+    "cpi", "inflation", "ppi", "payroll", "nonfarm", "non-farm", "jobless",
+    "unemployment", "gdp", "recession", "pmi", "retail sales", "jobs report",
+    "tariff", "trade war", "sanction", "war", "attack", "strike", "missile",
+    "drone", "escalation", "ceasefire", "invasion", "opec", "crude", "oil price",
+    "shutdown", "debt ceiling", "default",
+    "dollar", "euro", "yen", "sterling", "pound", "swiss franc", "aussie",
+    "loonie", "kiwi", "yuan", "peso", "usd/", "eur/", "gbp/", "/jpy", "/usd",
+    "greenback", "currency",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +140,71 @@ def compound_pairs(evs: list[CanonicalEvent]):
             if ei.currency != ej.currency and abs(si - sj) >= CLUSTER_MIN:
                 out.append((ei, ej, si - sj))
     out.sort(key=lambda t: -abs(t[2]))
+    return out
+
+
+def _recent_ntfy_bodies(hours: int = 12) -> set[str]:
+    """Recently-sent ntfy message bodies -- used to not resend the same headline."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return set()
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{topic}/json?poll=1&since={hours}h")
+        raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+    except Exception:
+        return set()
+    bodies = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            m = json.loads(line)
+        except Exception:
+            continue
+        if m.get("event") == "message":
+            bodies.add(m.get("message", ""))
+    return bodies
+
+
+def news_lines() -> list[str]:
+    """Fresh market-moving headlines from the news feeds (no direction call --
+    a keyword match can't judge sentiment)."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=NEWS_LOOKBACK_MIN)
+    already = _recent_ntfy_bodies()
+    hits: list[tuple[datetime, str]] = []
+    for url in NEWS_FEEDS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            root = ET.fromstring(urllib.request.urlopen(req, timeout=20).read())
+        except Exception as exc:
+            print(f"news feed failed {url}: {exc}")
+            continue
+        for it in root.iter("item"):
+            title = (it.findtext("title") or "").replace("FinancialJuice:", "").strip()
+            try:
+                t = parsedate_to_datetime(it.findtext("pubDate") or "")
+            except (TypeError, ValueError):
+                continue
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if t < cutoff or not title:
+                continue
+            low = title.lower()
+            if not any(k in low for k in NEWS_KEYWORDS):
+                continue
+            if any(title in b for b in already):
+                continue
+            hits.append((t, title))
+    hits.sort()
+    seen: set[str] = set()
+    out = []
+    for t, title in hits:
+        if title in seen:
+            continue
+        seen.add(title)
+        out.append(f"NOTICIA ({t.astimezone(MTY):%H:%M} MTY): {title}")
     return out
 
 
@@ -208,14 +299,23 @@ def cmd_watch() -> None:
         lines.append(f"MOVER [{imp}]: {cur} ({detail}) {'mas fuerte' if stronger else 'mas debil'} "
                      f"de lo esperado -> {lean(cur, stronger)}")
 
-    if not lines:
+    # 4) unscheduled headlines (central-bank talk, geopolitics, oil, ...)
+    news = news_lines()
+
+    if not lines and not news:
         print("NOTHING NEW")
         return
+
     for ln in lines[:8]:
         print(ln)
         title = "Forex - por salir" if ln.startswith("UPCOMING") else "Forex - direccion"
         notify(ln[:200], title=title)
     for ln in lines[8:]:
+        print(ln)
+    for ln in news[:6]:
+        print(ln)
+        notify(ln[:200], title="Forex - noticia")
+    for ln in news[6:]:
         print(ln)
 
 
