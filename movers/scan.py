@@ -54,6 +54,7 @@ CLUSTER_MIN = 0.35
 # how the pair is quoted, to turn "currency strengthens" into an up/down lean
 _INVERSE = {"EUR", "GBP", "AUD", "NZD"}   # quoted X/USD  -> X strong = pair up
 _DIRECT = {"JPY", "CAD", "CHF"}           # quoted USD/X  -> X strong = pair down
+_GOLD = {"XAU", "GOLD", "ORO"}            # gold: inverse of USD, or its own safe-haven call
 
 # --- unscheduled news headlines (central-bank talk, geopolitics, ...) --------
 # Financial Juice = a real breaking-headline wire (squawk style). FXStreet's
@@ -71,12 +72,16 @@ _CLASSIFY_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "relevant": {"type": "BOOLEAN",
-                     "description": "true if this could move a major FX pair today"},
+                     "description": "true if this could move a major FX pair or gold today"},
         "currency": {"type": "STRING",
-                     "description": "the single currency most affected: USD, EUR, GBP, "
-                                    "JPY, AUD, CAD, CHF or NZD; empty string if none fits"},
+                     "description": "the single asset most affected: USD, EUR, GBP, JPY, "
+                                    "AUD, CAD, CHF, NZD, or XAU for gold; empty string if "
+                                    "none fits. Use XAU for safe-haven flows, real-yield "
+                                    "moves, or Fed-policy headlines that mainly matter "
+                                    "through gold rather than a specific FX pair"},
         "direction": {"type": "STRING", "enum": ["up", "down", "neutral"],
-                      "description": "does that currency strengthen, weaken, or neither"},
+                      "description": "does that asset strengthen, weaken, or neither -- "
+                                     "for XAU this means gold's own price, not USD"},
         "reason": {"type": "STRING", "description": "why, in Spanish, under 12 words"},
     },
     "required": ["relevant", "currency", "direction", "reason"],
@@ -95,6 +100,8 @@ NEWS_KEYWORDS = (
     "dollar", "euro", "yen", "sterling", "pound", "swiss franc", "aussie",
     "loonie", "kiwi", "yuan", "peso", "usd/", "eur/", "gbp/", "/jpy", "/usd",
     "greenback", "currency",
+    "gold", "xau", "bullion", "safe haven", "safe-haven", "safehaven",
+    "real yield", "treasury", "10-year", "10 year", "risk-off", "risk off",
 )
 
 
@@ -125,6 +132,9 @@ def lean(currency: str, stronger: bool) -> str:
     inv = "ABAJO" if stronger else "ARRIBA"
     if currency == "USD":
         return f"USD se inclina {up} -> EUR/USD, GBP/USD y oro {inv}; USD/JPY, USD/CAD {up}"
+    if currency in _GOLD:
+        # gold quoted XAU/USD: "stronger" here means gold itself is stronger (bid)
+        return f"Oro (XAU/USD) se inclina {up}"
     if currency in _INVERSE:
         return f"{currency}/USD se inclina {up}"
     if currency in _DIRECT:
@@ -197,9 +207,13 @@ def classify_headline(title: str) -> dict | None:
     body = {
         "contents": [{"parts": [{"text": (
             f"Financial news-wire headline: {title!r}\n\n"
-            "Is this likely to move a major FX pair today? If so, which "
-            "single currency is most affected, and does it strengthen or "
-            "weaken? Answer the 'reason' field in Spanish, under 12 words."
+            "Is this likely to move a major FX pair or gold (XAU/USD) today? "
+            "Gold trades on US real yields, Fed policy expectations, and "
+            "safe-haven demand during geopolitical stress or market risk-off "
+            "-- flag it as XAU when that is the main channel, even if no FX "
+            "pair is named. Which single asset is most affected, and does it "
+            "strengthen or weaken? Answer the 'reason' field in Spanish, "
+            "under 12 words."
         )}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
@@ -269,7 +283,7 @@ def news_lines() -> list[str]:
             out.append(f"NOTICIA {stamp}: {title}")
             continue
         if not verdict.get("relevant"):
-            continue  # Claude read it and it doesn't actually matter for FX
+            continue  # Gemini read it and it doesn't actually matter for FX/gold
         cur, direction, reason = verdict.get("currency", ""), verdict.get("direction", "neutral"), verdict.get("reason", "")
         call = f" -> {lean(cur, direction == 'up')}" if cur and direction in ("up", "down") else ""
         out.append(f"NOTICIA {stamp}: {title} [{reason}]{call}")
@@ -350,6 +364,9 @@ def cmd_watch() -> None:
                 f"{strong.forecast_raw} + {weak.currency} {weak.title} {weak.actual_raw} vs "
                 f"{weak.forecast_raw} -> {strong.currency}/{weak.currency} se inclina ARRIBA"
             )
+            if "USD" in (strong.currency, weak.currency):
+                usd_stronger = strong.currency == "USD"
+                lines.append(f"MOVER (DOBLE): ORO -> {lean('XAU', not usd_stronger)}")
 
     # 3) direction: single releases off forecast, grouped so the four CPI
     #    sub-series (m/m, y/y, core...) become one line, not four
@@ -366,6 +383,11 @@ def cmd_watch() -> None:
         detail = "; ".join(f"{e.title} {e.actual_raw} vs {e.forecast_raw}" for e in evs[:3])
         lines.append(f"MOVER [{imp}]: {cur} ({detail}) {'mas fuerte' if stronger else 'mas debil'} "
                      f"de lo esperado -> {lean(cur, stronger)}")
+        if cur == "USD":
+            # gold's own line -- inverse of USD (real-yield / safe-haven thesis),
+            # called out on its own instead of buried in the USD cross-list
+            lines.append(f"MOVER [{imp}]: ORO -- {cur} sorprendio ({'mas fuerte' if stronger else 'mas debil'}) "
+                         f"-> {lean('XAU', not stronger)}")
 
     # 4) unscheduled headlines (central-bank talk, geopolitics, oil, ...)
     news = news_lines()
