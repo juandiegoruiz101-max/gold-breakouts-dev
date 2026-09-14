@@ -82,9 +82,15 @@ _CLASSIFY_SCHEMA = {
         "direction": {"type": "STRING", "enum": ["up", "down", "neutral"],
                       "description": "does that asset strengthen, weaken, or neither -- "
                                      "for XAU this means gold's own price, not USD"},
+        "magnitude": {"type": "STRING", "enum": ["major", "minor"],
+                      "description": "'major' = on the scale of a CPI/NFP/PPI print, a "
+                                     "central bank rate decision, a war outbreak or big "
+                                     "military escalation, or another headline traders "
+                                     "would drop what they're doing for. 'minor' = "
+                                     "genuinely relevant but everyday-tier news"},
         "reason": {"type": "STRING", "description": "why, in Spanish, under 12 words"},
     },
-    "required": ["relevant", "currency", "direction", "reason"],
+    "required": ["relevant", "currency", "direction", "magnitude", "reason"],
 }
 NEWS_KEYWORDS = (
     "fed", "fomc", "powell", "boj", "bank of japan", "ueda", "ecb", "lagarde",
@@ -125,21 +131,31 @@ def _ts(iso: str) -> datetime:
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
+_NAMES = {
+    "EUR": "el euro", "GBP": "la libra", "AUD": "el dolar australiano",
+    "NZD": "el dolar neozelandes", "JPY": "el yen", "CAD": "el dolar canadiense",
+    "CHF": "el franco suizo",
+}
+
+
 def lean(currency: str, stronger: bool) -> str:
-    """Turn 'this currency came in stronger/weaker than forecast' into an up/down
-    call on the common pairs."""
-    up = "ARRIBA" if stronger else "ABAJO"
-    inv = "ABAJO" if stronger else "ARRIBA"
+    """Turn 'this currency came in stronger/weaker than forecast' into a plain
+    Spanish sentence -- 'sube'/'baja', no arrows or symbols."""
+    sube = "sube" if stronger else "baja"
+    baja = "baja" if stronger else "sube"
+    bajan = "bajan" if stronger else "suben"
+    suben = "suben" if stronger else "bajan"
     if currency == "USD":
-        return f"USD se inclina {up} -> EUR/USD, GBP/USD y oro {inv}; USD/JPY, USD/CAD {up}"
+        return (f"el dolar {sube}, por eso el euro y la libra {bajan}, el oro {baja}, "
+                f"y el yen y el dolar canadiense {suben}")
     if currency in _GOLD:
         # gold quoted XAU/USD: "stronger" here means gold itself is stronger (bid)
-        return f"Oro (XAU/USD) se inclina {up}"
+        return f"el oro {sube}"
     if currency in _INVERSE:
-        return f"{currency}/USD se inclina {up}"
+        return f"{_NAMES[currency]} {sube}"
     if currency in _DIRECT:
-        return f"USD/{currency} se inclina {inv}"
-    return f"{currency} {'mas fuerte' if stronger else 'mas debil'} de lo esperado"
+        return f"{_NAMES[currency]} {baja}"
+    return f"{currency} salio {'mas fuerte' if stronger else 'mas debil'} de lo esperado"
 
 
 def fetch_today() -> list[CanonicalEvent]:
@@ -211,9 +227,9 @@ def classify_headline(title: str) -> dict | None:
             "Gold trades on US real yields, Fed policy expectations, and "
             "safe-haven demand during geopolitical stress or market risk-off "
             "-- flag it as XAU when that is the main channel, even if no FX "
-            "pair is named. Which single asset is most affected, and does it "
-            "strengthen or weaken? Answer the 'reason' field in Spanish, "
-            "under 12 words."
+            "pair is named. Which single asset is most affected, does it "
+            "strengthen or weaken, and how big a deal is this headline? "
+            "Answer the 'reason' field in Spanish, under 12 words."
         )}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
@@ -237,11 +253,13 @@ def classify_headline(title: str) -> dict | None:
         return None
 
 
-def news_lines() -> list[str]:
-    """Fresh market-moving headlines from the news feeds. Each one that passes
-    the keyword pre-filter gets read by Claude, which drops it if it isn't
-    really FX-relevant and adds a direction call when it is. Without
-    ANTHROPIC_API_KEY, falls back to forwarding the plain headline."""
+def news_lines() -> list[tuple[str, bool]]:
+    """Fresh market-moving headlines from the news feeds, as (text, important)
+    pairs. Each one that passes the keyword pre-filter gets read by Gemini,
+    which drops it if it isn't really FX/gold-relevant, adds a direction call
+    when it is, and marks it important when it's CPI/NFP/rate-decision/war
+    tier. Without GEMINI_API_KEY, falls back to forwarding the plain headline
+    as not-important (severity can't be judged without the model)."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=NEWS_LOOKBACK_MIN)
     already = _recent_ntfy_bodies()
@@ -280,26 +298,39 @@ def news_lines() -> list[str]:
 
         verdict = classify_headline(title)
         if verdict is None:
-            out.append(f"NOTICIA {stamp}: {title}")
+            out.append((f"NOTICIA {stamp}: {title}", False))
             continue
         if not verdict.get("relevant"):
             continue  # Gemini read it and it doesn't actually matter for FX/gold
         cur, direction, reason = verdict.get("currency", ""), verdict.get("direction", "neutral"), verdict.get("reason", "")
-        call = f" -> {lean(cur, direction == 'up')}" if cur and direction in ("up", "down") else ""
-        out.append(f"NOTICIA {stamp}: {title} [{reason}]{call}")
+        important = verdict.get("magnitude") == "major"
+        call = f" {lean(cur, direction == 'up').capitalize()}." if cur and direction in ("up", "down") else ""
+        out.append((f"NOTICIA {stamp}: {title} [{reason}]{call}", important))
     return out
 
 
-def notify(message: str, *, title: str = "Forex") -> None:
+def notify(message: str, *, title: str = "Forex", important: bool = False) -> None:
     """POST to ntfy.sh. No-op unless NTFY_TOPIC is set (kept out of the repo --
-    it is a bearer secret; injected by the GitHub Actions secret / local env)."""
+    it is a bearer secret; injected by the GitHub Actions secret / local env).
+
+    important=True is for things on the scale of CPI/NFP/PPI, a rate decision,
+    or a war headline -- the ones the user wants impossible to miss. A push
+    notification can't render colored or large text (that's the OS's call,
+    not the app's), so this is the closest equivalent: urgent priority (shows
+    with a red bar in the ntfy app, can break through silent mode) plus
+    alert-siren/red-circle tags, which ntfy renders as emoji. Everything else
+    stays at default priority with no tags."""
     topic = os.environ.get("NTFY_TOPIC")
     if not topic:
         return
+    headers = {"Title": f"IMPORTANTE - {title}" if important else title}
+    if important:
+        headers["Priority"] = "urgent"
+        headers["Tags"] = "rotating_light,red_circle"
     req = urllib.request.Request(
         f"https://ntfy.sh/{topic}",
         data=message.encode("utf-8"),
-        headers={"Title": title},
+        headers=headers,
         method="POST",
     )
     try:
@@ -336,9 +367,10 @@ def cmd_watch() -> None:
     events = fetch_today()
     watched = [e for e in events if e.impact in WATCH_IMPACT]  # high AND medium
 
-    lines: list[str] = []
+    lines: list[tuple[str, bool]] = []  # (text, important)
 
-    # 1) heads-up: events about to release
+    # 1) heads-up: events about to release. High impact = important (CPI/NFP/
+    #    rate-decision tier); medium = normal.
     for e in sorted(watched, key=lambda e: e.datetime_utc):
         if e.actual_raw:
             continue
@@ -347,11 +379,13 @@ def cmd_watch() -> None:
             others = sorted({x.currency for x in watched
                              if x.datetime_utc == e.datetime_utc and x.currency != e.currency})
             extra = f" (+ {', '.join(others)} al mismo tiempo)" if others else ""
-            lines.append(f"UPCOMING: en ~{round(mins)} min "
-                         f"({_ts(e.datetime_utc).astimezone(MTY):%H:%M} MTY) "
-                         f"[{e.impact}] {e.currency} {e.title}{extra} -- preparate")
+            text = (f"UPCOMING: en ~{round(mins)} min "
+                    f"({_ts(e.datetime_utc).astimezone(MTY):%H:%M} MTY) "
+                    f"[{e.impact}] {e.currency} {e.title}{extra} -- preparate")
+            lines.append((text, e.impact == "high"))
 
-    # 2) direction: high-conviction double-surprise clusters first
+    # 2) direction: high-conviction double-surprise clusters first -- two
+    #    currencies surprising in the same instant is always a big-mover case
     clustered_ids: set[str] = set()
     for ts, evs in clusters(events, impacts=WATCH_IMPACT).items():
         if not (recent <= _ts(ts) <= now):
@@ -359,17 +393,19 @@ def cmd_watch() -> None:
         for ei, ej, diff in compound_pairs(evs):
             strong, weak = (ei, ej) if diff > 0 else (ej, ei)
             clustered_ids.update([ei.source_event_id, ej.source_event_id])
-            lines.append(
+            lines.append((
                 f"MOVER (DOBLE): {strong.currency} {strong.title} {strong.actual_raw} vs "
-                f"{strong.forecast_raw} + {weak.currency} {weak.title} {weak.actual_raw} vs "
-                f"{weak.forecast_raw} -> {strong.currency}/{weak.currency} se inclina ARRIBA"
-            )
+                f"{strong.forecast_raw}, y al mismo tiempo {weak.currency} {weak.title} "
+                f"{weak.actual_raw} vs {weak.forecast_raw}. {strong.currency} sube.",
+                True,
+            ))
             if "USD" in (strong.currency, weak.currency):
                 usd_stronger = strong.currency == "USD"
-                lines.append(f"MOVER (DOBLE): ORO -> {lean('XAU', not usd_stronger)}")
+                lines.append((f"MOVER (DOBLE): ORO. {lean('XAU', not usd_stronger).capitalize()}.", True))
 
     # 3) direction: single releases off forecast, grouped so the four CPI
-    #    sub-series (m/m, y/y, core...) become one line, not four
+    #    sub-series (m/m, y/y, core...) become one line, not four. Important
+    #    iff any sub-series in the group is high impact.
     buckets: dict[tuple, list[CanonicalEvent]] = defaultdict(list)
     for e in watched:
         if not e.actual_raw or e.source_better_worse == 0 or e.source_event_id in clustered_ids:
@@ -379,15 +415,16 @@ def cmd_watch() -> None:
 
     for (cur, _dt, bw), evs in buckets.items():
         stronger = bw == 1
-        imp = "alto" if any(e.impact == "high" for e in evs) else "medio"
+        is_high = any(e.impact == "high" for e in evs)
+        imp = "alto" if is_high else "medio"
         detail = "; ".join(f"{e.title} {e.actual_raw} vs {e.forecast_raw}" for e in evs[:3])
-        lines.append(f"MOVER [{imp}]: {cur} ({detail}) {'mas fuerte' if stronger else 'mas debil'} "
-                     f"de lo esperado -> {lean(cur, stronger)}")
+        lines.append((f"MOVER [{imp}]: {cur} ({detail}) salio {'mas fuerte' if stronger else 'mas debil'} "
+                     f"de lo esperado. {lean(cur, stronger).capitalize()}.", is_high))
         if cur == "USD":
             # gold's own line -- inverse of USD (real-yield / safe-haven thesis),
             # called out on its own instead of buried in the USD cross-list
-            lines.append(f"MOVER [{imp}]: ORO -- {cur} sorprendio ({'mas fuerte' if stronger else 'mas debil'}) "
-                         f"-> {lean('XAU', not stronger)}")
+            lines.append((f"MOVER [{imp}]: ORO. {cur} salio {'mas fuerte' if stronger else 'mas debil'} "
+                         f"de lo esperado. {lean('XAU', not stronger).capitalize()}.", is_high))
 
     # 4) unscheduled headlines (central-bank talk, geopolitics, oil, ...)
     news = news_lines()
@@ -396,17 +433,17 @@ def cmd_watch() -> None:
         print("NOTHING NEW")
         return
 
-    for ln in lines[:8]:
-        print(ln)
-        title = "Forex - por salir" if ln.startswith("UPCOMING") else "Forex - direccion"
-        notify(ln[:200], title=title)
-    for ln in lines[8:]:
-        print(ln)
-    for ln in news[:6]:
-        print(ln)
-        notify(ln[:200], title="Forex - noticia")
-    for ln in news[6:]:
-        print(ln)
+    for text, important in lines[:8]:
+        print(text)
+        title = "Forex - por salir" if text.startswith("UPCOMING") else "Forex - direccion"
+        notify(text[:200], title=title, important=important)
+    for text, _important in lines[8:]:
+        print(text)
+    for text, important in news[:6]:
+        print(text)
+        notify(text[:200], title="Forex - noticia", important=important)
+    for text, _important in news[6:]:
+        print(text)
 
 
 def main(argv=None) -> None:
