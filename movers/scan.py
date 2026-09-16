@@ -31,6 +31,7 @@ import argparse
 import html
 import json
 import os
+import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -119,6 +120,14 @@ NEWS_KEYWORDS = (
     "greenback", "currency",
     "gold", "xau", "bullion", "safe haven", "safe-haven", "safehaven",
     "real yield", "treasury", "10-year", "10 year", "risk-off", "risk off",
+)
+# word-boundary match, not substring -- otherwise short keywords like "pmi" or
+# "war" false-positive inside unrelated words ("DeepMind" contains "pmi",
+# "software" contains "war"). Only the safety net for when Gemini is
+# unavailable (no GEMINI_API_KEY, or the call fails), so worth getting right.
+_NEWS_KEYWORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in NEWS_KEYWORDS) + r")\b",
+    re.IGNORECASE,
 )
 
 
@@ -293,8 +302,7 @@ def news_lines() -> list[tuple[str, bool]]:
                 t = t.replace(tzinfo=timezone.utc)
             if t < cutoff or not title:
                 continue
-            low = title.lower()
-            if not any(k in low for k in NEWS_KEYWORDS):
+            if not _NEWS_KEYWORD_RE.search(title):
                 continue
             if any(title in b for b in already):
                 continue
