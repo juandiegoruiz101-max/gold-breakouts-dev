@@ -4,7 +4,11 @@ Covers every high AND medium impact event (anything that can nudge price).
 Two things, per run:
   1. a heads-up BEFORE a release ("UPCOMING") so there is time to get ready, and
   2. a direction call the moment a number lands off forecast ("MOVER"): which
-     way the currency leans, up or down. Lines are tagged [alto] / [medio].
+     way the currency leans, up or down. Every line -- calendar or news -- is
+     tagged [alto] / [medio] / [bajo], so it's always clear how much weight to
+     put on the call (a technically on-topic headline that the market usually
+     shrugs off, like a current-account print, still gets a direction call but
+     tagged [bajo] instead of reading as confidently as a CPI/NFP release).
 
 Modes:
     python3 -m movers.scan brief   -- once a day: the full schedule for today
@@ -44,6 +48,7 @@ RAW_DIR = REPO / "01 Data" / "raw" / "forexfactory"
 MTY = ZoneInfo("America/Monterrey")  # fixed UTC-6, no DST since Mexico's 2022 reform
 
 WATCH_IMPACT = ("high", "medium")   # brief + watch both cover high AND medium
+_IMPACT_ES = {"high": "alto", "medium": "medio", "low": "bajo"}
 LEAD_MIN = 12       # "UPCOMING" fires for events releasing within this window
 LOOKBACK_MIN = 8    # "MOVER" fires for releases at most this old (keep >= cron interval)
 
@@ -82,15 +87,21 @@ _CLASSIFY_SCHEMA = {
         "direction": {"type": "STRING", "enum": ["up", "down", "neutral"],
                       "description": "does that asset strengthen, weaken, or neither -- "
                                      "for XAU this means gold's own price, not USD"},
-        "magnitude": {"type": "STRING", "enum": ["major", "minor"],
-                      "description": "'major' = on the scale of a CPI/NFP/PPI print, a "
-                                     "central bank rate decision, a war outbreak or big "
-                                     "military escalation, or another headline traders "
-                                     "would drop what they're doing for. 'minor' = "
-                                     "genuinely relevant but everyday-tier news"},
+        "impact": {"type": "STRING", "enum": ["alto", "medio", "bajo"],
+                   "description": "how much this can actually move price, same three tiers "
+                                  "ForexFactory itself uses for scheduled events. 'alto' = "
+                                  "CPI/NFP/PPI-tier, a central bank rate decision, a war "
+                                  "outbreak or big military escalation -- traders drop what "
+                                  "they're doing for this. 'medio' = genuinely market-moving "
+                                  "but not decisive on its own (a central banker's remarks, "
+                                  "a notable but not critical geopolitical update). 'bajo' = "
+                                  "on-topic and technically relevant, but the kind of release "
+                                  "the market historically shrugs off even when the textbook "
+                                  "direction is clear -- e.g. a current-account balance, a "
+                                  "minor revision, routine remarks with nothing new in them"},
         "reason": {"type": "STRING", "description": "why, in Spanish, under 12 words"},
     },
-    "required": ["relevant", "currency", "direction", "magnitude", "reason"],
+    "required": ["relevant", "currency", "direction", "impact", "reason"],
 }
 NEWS_KEYWORDS = (
     "fed", "fomc", "powell", "boj", "bank of japan", "ueda", "ecb", "lagarde",
@@ -257,9 +268,10 @@ def news_lines() -> list[tuple[str, bool]]:
     """Fresh market-moving headlines from the news feeds, as (text, important)
     pairs. Each one that passes the keyword pre-filter gets read by Gemini,
     which drops it if it isn't really FX/gold-relevant, adds a direction call
-    when it is, and marks it important when it's CPI/NFP/rate-decision/war
-    tier. Without GEMINI_API_KEY, falls back to forwarding the plain headline
-    as not-important (severity can't be judged without the model)."""
+    when it is, and tags it [alto]/[medio]/[bajo] -- only [alto] (CPI/NFP/
+    rate-decision/war tier) is marked important. Without GEMINI_API_KEY,
+    falls back to forwarding the plain headline untagged and not-important
+    (impact can't be judged without the model)."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=NEWS_LOOKBACK_MIN)
     already = _recent_ntfy_bodies()
@@ -303,9 +315,10 @@ def news_lines() -> list[tuple[str, bool]]:
         if not verdict.get("relevant"):
             continue  # Gemini read it and it doesn't actually matter for FX/gold
         cur, direction, reason = verdict.get("currency", ""), verdict.get("direction", "neutral"), verdict.get("reason", "")
-        important = verdict.get("magnitude") == "major"
+        impact = verdict.get("impact", "medio")
+        important = impact == "alto"
         call = f" {lean(cur, direction == 'up').capitalize()}." if cur and direction in ("up", "down") else ""
-        out.append((f"NOTICIA {stamp}: {title} [{reason}]{call}", important))
+        out.append((f"NOTICIA [{impact}] {stamp}: {title} [{reason}]{call}", important))
     return out
 
 
@@ -379,9 +392,9 @@ def cmd_watch() -> None:
             others = sorted({x.currency for x in watched
                              if x.datetime_utc == e.datetime_utc and x.currency != e.currency})
             extra = f" (+ {', '.join(others)} al mismo tiempo)" if others else ""
-            text = (f"UPCOMING: en ~{round(mins)} min "
+            text = (f"UPCOMING [{_IMPACT_ES.get(e.impact, e.impact)}]: en ~{round(mins)} min "
                     f"({_ts(e.datetime_utc).astimezone(MTY):%H:%M} MTY) "
-                    f"[{e.impact}] {e.currency} {e.title}{extra} -- preparate")
+                    f"{e.currency} {e.title}{extra} -- preparate")
             lines.append((text, e.impact == "high"))
 
     # 2) direction: high-conviction double-surprise clusters first -- two
@@ -394,14 +407,14 @@ def cmd_watch() -> None:
             strong, weak = (ei, ej) if diff > 0 else (ej, ei)
             clustered_ids.update([ei.source_event_id, ej.source_event_id])
             lines.append((
-                f"MOVER (DOBLE): {strong.currency} {strong.title} {strong.actual_raw} vs "
+                f"MOVER (DOBLE) [alto]: {strong.currency} {strong.title} {strong.actual_raw} vs "
                 f"{strong.forecast_raw}, y al mismo tiempo {weak.currency} {weak.title} "
                 f"{weak.actual_raw} vs {weak.forecast_raw}. {strong.currency} sube.",
                 True,
             ))
             if "USD" in (strong.currency, weak.currency):
                 usd_stronger = strong.currency == "USD"
-                lines.append((f"MOVER (DOBLE): ORO. {lean('XAU', not usd_stronger).capitalize()}.", True))
+                lines.append((f"MOVER (DOBLE) [alto]: ORO. {lean('XAU', not usd_stronger).capitalize()}.", True))
 
     # 3) direction: single releases off forecast, grouped so the four CPI
     #    sub-series (m/m, y/y, core...) become one line, not four. Important
@@ -425,6 +438,24 @@ def cmd_watch() -> None:
             # called out on its own instead of buried in the USD cross-list
             lines.append((f"MOVER [{imp}]: ORO. {cur} salio {'mas fuerte' if stronger else 'mas debil'} "
                          f"de lo esperado. {lean('XAU', not stronger).capitalize()}.", is_high))
+
+    # 3b) high-impact releases that landed exactly on forecast (bw == 0, so
+    # skipped above -- no surprise, no direction to call). An [alto] UPCOMING
+    # promised something worth prepping for; leaving that hanging with no
+    # follow-up reads as the watcher having failed, so send a closure line
+    # instead -- unimportant, since "nothing happened" isn't urgent.
+    inline_high: dict[tuple, list[CanonicalEvent]] = defaultdict(list)
+    for e in watched:
+        if (not e.actual_raw or e.source_better_worse != 0
+                or e.impact != "high" or e.source_event_id in clustered_ids):
+            continue
+        if recent <= _ts(e.datetime_utc) <= now:
+            inline_high[(e.currency, e.datetime_utc)].append(e)
+
+    for (cur, _dt), evs in inline_high.items():
+        detail = "; ".join(f"{e.title} {e.actual_raw} vs {e.forecast_raw}" for e in evs[:3])
+        lines.append((f"MOVER [alto]: {cur} ({detail}) salio en linea con lo esperado -- "
+                     f"sin sorpresa, no se espera movimiento fuerte por esto.", False))
 
     # 4) unscheduled headlines (central-bank talk, geopolitics, oil, ...)
     news = news_lines()
