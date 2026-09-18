@@ -68,7 +68,9 @@ _GOLD = {"XAU", "GOLD", "ORO"}            # gold: inverse of USD, or its own saf
 NEWS_FEEDS = (
     "https://www.financialjuice.com/feed.ashx?xy=rss",
 )
-NEWS_LOOKBACK_MIN = 15
+NEWS_LOOKBACK_MIN = 25  # GH Actions cron can lag well past its 5-min schedule;
+                        # a 25-min window survives that instead of silently
+                        # dropping a headline that ages out before any run sees it
 
 # Gemini (free tier) reads each headline that passes the keyword filter and
 # calls the direction -- this is what a keyword match alone can't do.
