@@ -49,6 +49,15 @@ RAW_DIR = REPO / "01 Data" / "raw" / "forexfactory"
 MTY = ZoneInfo("America/Monterrey")  # fixed UTC-6, no DST since Mexico's 2022 reform
 
 WATCH_IMPACT = ("high", "medium")   # brief + watch both cover high AND medium
+# safety net: watch these regardless of what impact ForexFactory assigns --
+# caught live when Japan's National Core CPI came through tagged "low" and
+# skipped UPCOMING/MOVER entirely, only reaching the user late via the noisier
+# news-wire path. categorize() matches by title text only, so this covers the
+# same release for every currency/country, not just the US version.
+WATCH_CATEGORIES = {
+    "CPI", "PPI", "PCE", "NFP", "ADP", "GDP", "UNEMPLOYMENT_RATE",
+    "JOBLESS_CLAIMS", "RETAIL_SALES", "FOMC", "RATE_DECISION",
+}
 _IMPACT_ES = {"high": "alto", "medium": "medio", "low": "bajo"}
 LEAD_MIN = 12       # "UPCOMING" fires for events releasing within this window
 LOOKBACK_MIN = 8    # "MOVER" fires for releases at most this old (keep >= cron interval)
@@ -188,10 +197,23 @@ def fetch_today() -> list[CanonicalEvent]:
     return [src.to_canonical(e) for e in raw if e.get("currency")]
 
 
-def clusters(events: list[CanonicalEvent], impacts=WATCH_IMPACT) -> dict[str, list[CanonicalEvent]]:
+def is_watched(e: CanonicalEvent) -> bool:
+    return e.impact in WATCH_IMPACT or e.category in WATCH_CATEGORIES
+
+
+def display_impact(e: CanonicalEvent) -> str:
+    """Impact tag to show the user -- promotes a category-safety-netted event
+    (FF says low, but it's a CPI/NFP/rate-decision-type release) to "medio"
+    instead of showing the misleading "bajo" it would otherwise carry."""
+    if e.impact in _IMPACT_ES and e.impact != "low":
+        return _IMPACT_ES[e.impact]
+    return "medio" if e.category in WATCH_CATEGORIES else _IMPACT_ES.get(e.impact, e.impact)
+
+
+def clusters(events: list[CanonicalEvent]) -> dict[str, list[CanonicalEvent]]:
     groups: dict[str, list[CanonicalEvent]] = {}
     for e in events:
-        if e.impact in impacts:
+        if is_watched(e):
             groups.setdefault(e.datetime_utc, []).append(e)
     return groups
 
@@ -389,7 +411,7 @@ def cmd_watch() -> None:
     now = datetime.now(timezone.utc)
     recent = now - timedelta(minutes=LOOKBACK_MIN)
     events = fetch_today()
-    watched = [e for e in events if e.impact in WATCH_IMPACT]  # high AND medium
+    watched = [e for e in events if is_watched(e)]
 
     lines: list[tuple[str, bool]] = []  # (text, important)
 
@@ -403,7 +425,7 @@ def cmd_watch() -> None:
             others = sorted({x.currency for x in watched
                              if x.datetime_utc == e.datetime_utc and x.currency != e.currency})
             extra = f" (+ {', '.join(others)} al mismo tiempo)" if others else ""
-            text = (f"UPCOMING [{_IMPACT_ES.get(e.impact, e.impact)}]: en ~{round(mins)} min "
+            text = (f"UPCOMING [{display_impact(e)}]: en ~{round(mins)} min "
                     f"({_ts(e.datetime_utc).astimezone(MTY):%H:%M} MTY) "
                     f"{e.currency} {e.title}{extra} -- preparate")
             lines.append((text, e.impact == "high"))
@@ -411,7 +433,7 @@ def cmd_watch() -> None:
     # 2) direction: high-conviction double-surprise clusters first -- two
     #    currencies surprising in the same instant is always a big-mover case
     clustered_ids: set[str] = set()
-    for ts, evs in clusters(events, impacts=WATCH_IMPACT).items():
+    for ts, evs in clusters(events).items():
         if not (recent <= _ts(ts) <= now):
             continue
         for ei, ej, diff in compound_pairs(evs):

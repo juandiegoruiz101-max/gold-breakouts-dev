@@ -70,6 +70,9 @@ _CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("ISM_MFG",             ("ism manufacturing",)),
     ("ISM_SVC",             ("ism services", "ism non-manufacturing")),
     ("FOMC",                ("fomc", "federal funds rate", "fed chair", "fed interest rate")),
+    ("RATE_DECISION",       ("interest rate decision", "policy rate", "cash rate",
+                             "monetary policy statement", "official bank rate",
+                             "refinancing rate")),
 ]
 
 
