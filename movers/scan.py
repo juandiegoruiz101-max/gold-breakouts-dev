@@ -160,21 +160,22 @@ _NAMES = {
 
 def lean(currency: str, stronger: bool) -> str:
     """Turn 'this currency came in stronger/weaker than forecast' into a plain
-    Spanish sentence -- 'sube'/'baja', no arrows or symbols."""
+    Spanish sentence -- 'sube'/'baja', no arrows or symbols. Always describes
+    the CURRENCY's own value (the natural reading of "el yen sube"), never the
+    USD/X pair's chart direction -- those move opposite for JPY/CAD/CHF, and
+    mixing the two conventions produced self-contradicting messages (Gemini's
+    "reason" text saying "debilita al yen" right next to a "sube" call)."""
     sube = "sube" if stronger else "baja"
     baja = "baja" if stronger else "sube"
     bajan = "bajan" if stronger else "suben"
-    suben = "suben" if stronger else "bajan"
     if currency == "USD":
         return (f"el dolar {sube}, por eso el euro y la libra {bajan}, el oro {baja}, "
-                f"y el yen y el dolar canadiense {suben}")
+                f"y el yen y el dolar canadiense {bajan}")
     if currency in _GOLD:
         # gold quoted XAU/USD: "stronger" here means gold itself is stronger (bid)
         return f"el oro {sube}"
-    if currency in _INVERSE:
+    if currency in _INVERSE or currency in _DIRECT:
         return f"{_NAMES[currency]} {sube}"
-    if currency in _DIRECT:
-        return f"{_NAMES[currency]} {baja}"
     return f"{currency} salio {'mas fuerte' if stronger else 'mas debil'} de lo esperado"
 
 
