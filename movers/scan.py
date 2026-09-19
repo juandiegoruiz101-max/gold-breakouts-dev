@@ -298,17 +298,22 @@ def classify_headline(title: str) -> dict | None:
         return None
 
 
-def news_lines() -> list[tuple[str, bool]]:
+def news_lines(already: set[str] | None = None) -> list[tuple[str, bool]]:
     """Fresh market-moving headlines from the news feeds, as (text, important)
     pairs. Each one that passes the keyword pre-filter gets read by Gemini,
     which drops it if it isn't really FX/gold-relevant, adds a direction call
     when it is, and tags it [alto]/[medio]/[bajo] -- only [alto] (CPI/NFP/
     rate-decision/war tier) is marked important. Without GEMINI_API_KEY,
     falls back to forwarding the plain headline untagged and not-important
-    (impact can't be judged without the model)."""
+    (impact can't be judged without the model).
+
+    `already` -- recently-sent ntfy bodies, so a caller that already fetched
+    them (cmd_watch, to dedup its own lines) can pass them in instead of this
+    function re-fetching the same history."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=NEWS_LOOKBACK_MIN)
-    already = _recent_ntfy_bodies()
+    if already is None:
+        already = _recent_ntfy_bodies()
     hits: list[tuple[datetime, str]] = []
     for url in NEWS_FEEDS:
         try:
@@ -413,6 +418,17 @@ def cmd_watch() -> None:
     events = fetch_today()
     watched = [e for e in events if is_watched(e)]
 
+    # A tight cron interval (e.g. an external pinger running every 1 min
+    # instead of GitHub's unreliable 5-min schedule) means the same event can
+    # fall inside LOOKBACK_MIN/LEAD_MIN across many consecutive runs. Without
+    # this, that's repeat sends of the same call -- dedup against what's
+    # actually already on the phone rather than re-deriving "did I send this"
+    # some other way.
+    already = _recent_ntfy_bodies()
+
+    def already_sent(key: str) -> bool:
+        return any(key in b for b in already)
+
     lines: list[tuple[str, bool]] = []  # (text, important)
 
     # 1) heads-up: events about to release. High impact = important (CPI/NFP/
@@ -422,6 +438,9 @@ def cmd_watch() -> None:
             continue
         mins = (_ts(e.datetime_utc) - now).total_seconds() / 60
         if 0 < mins <= LEAD_MIN:
+            stable_key = f"{e.currency} {e.title}"
+            if already_sent(stable_key):
+                continue
             others = sorted({x.currency for x in watched
                              if x.datetime_utc == e.datetime_utc and x.currency != e.currency})
             extra = f" (+ {', '.join(others)} al mismo tiempo)" if others else ""
@@ -439,15 +458,16 @@ def cmd_watch() -> None:
         for ei, ej, diff in compound_pairs(evs):
             strong, weak = (ei, ej) if diff > 0 else (ej, ei)
             clustered_ids.update([ei.source_event_id, ej.source_event_id])
-            lines.append((
-                f"MOVER (DOBLE) [alto]: {strong.currency} {strong.title} {strong.actual_raw} vs "
-                f"{strong.forecast_raw}, y al mismo tiempo {weak.currency} {weak.title} "
-                f"{weak.actual_raw} vs {weak.forecast_raw}. {strong.currency} sube.",
-                True,
-            ))
+            text = (f"MOVER (DOBLE) [alto]: {strong.currency} {strong.title} {strong.actual_raw} vs "
+                    f"{strong.forecast_raw}, y al mismo tiempo {weak.currency} {weak.title} "
+                    f"{weak.actual_raw} vs {weak.forecast_raw}. {strong.currency} sube.")
+            if not already_sent(text):
+                lines.append((text, True))
             if "USD" in (strong.currency, weak.currency):
                 usd_stronger = strong.currency == "USD"
-                lines.append((f"MOVER (DOBLE) [alto]: ORO. {lean('XAU', not usd_stronger).capitalize()}.", True))
+                oro_text = f"MOVER (DOBLE) [alto]: ORO. {lean('XAU', not usd_stronger).capitalize()}."
+                if not already_sent(oro_text):
+                    lines.append((oro_text, True))
 
     # 3) direction: single releases off forecast, grouped so the four CPI
     #    sub-series (m/m, y/y, core...) become one line, not four. Important
@@ -464,13 +484,17 @@ def cmd_watch() -> None:
         is_high = any(e.impact == "high" for e in evs)
         imp = "alto" if is_high else "medio"
         detail = "; ".join(f"{e.title} {e.actual_raw} vs {e.forecast_raw}" for e in evs[:3])
-        lines.append((f"MOVER [{imp}]: {cur} ({detail}) salio {'mas fuerte' if stronger else 'mas debil'} "
-                     f"de lo esperado. {lean(cur, stronger).capitalize()}.", is_high))
+        text = (f"MOVER [{imp}]: {cur} ({detail}) salio {'mas fuerte' if stronger else 'mas debil'} "
+                f"de lo esperado. {lean(cur, stronger).capitalize()}.")
+        if not already_sent(text):
+            lines.append((text, is_high))
         if cur == "USD":
             # gold's own line -- inverse of USD (real-yield / safe-haven thesis),
             # called out on its own instead of buried in the USD cross-list
-            lines.append((f"MOVER [{imp}]: ORO. {cur} salio {'mas fuerte' if stronger else 'mas debil'} "
-                         f"de lo esperado. {lean('XAU', not stronger).capitalize()}.", is_high))
+            oro_text = (f"MOVER [{imp}]: ORO. {cur} salio {'mas fuerte' if stronger else 'mas debil'} "
+                        f"de lo esperado. {lean('XAU', not stronger).capitalize()}.")
+            if not already_sent(oro_text):
+                lines.append((oro_text, is_high))
 
     # 3b) high-impact releases that landed exactly on forecast (bw == 0, so
     # skipped above -- no surprise, no direction to call). An [alto] UPCOMING
@@ -487,11 +511,13 @@ def cmd_watch() -> None:
 
     for (cur, _dt), evs in inline_high.items():
         detail = "; ".join(f"{e.title} {e.actual_raw} vs {e.forecast_raw}" for e in evs[:3])
-        lines.append((f"MOVER [alto]: {cur} ({detail}) salio en linea con lo esperado -- "
-                     f"sin sorpresa, no se espera movimiento fuerte por esto.", False))
+        text = (f"MOVER [alto]: {cur} ({detail}) salio en linea con lo esperado -- "
+                f"sin sorpresa, no se espera movimiento fuerte por esto.")
+        if not already_sent(text):
+            lines.append((text, False))
 
     # 4) unscheduled headlines (central-bank talk, geopolitics, oil, ...)
-    news = news_lines()
+    news = news_lines(already)
 
     if not lines and not news:
         print("NOTHING NEW")
